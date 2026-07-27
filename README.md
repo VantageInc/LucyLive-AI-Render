@@ -63,6 +63,16 @@ Created by **[VantageInc](https://vantageinc.co/) / [@thesibilev](https://www.in
 
 You can also provide the key through the `FAL_KEY` environment variable.
 
+## License
+
+LucyLive is free to use in personal and commercial creative projects. You may
+share the official repository link. Reselling, mirroring, repackaging,
+redistributing the plugin files, and distributing modified versions are not
+permitted.
+
+This is a proprietary source-available preview, not an open-source release.
+See the [LucyLive Preview License](LICENSE.md) for the complete terms.
+
 ## Cloud processing and cost
 
 Prompts, viewport frames, and optional reference images are sent to an external
