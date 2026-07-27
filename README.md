@@ -19,7 +19,7 @@ remote generative model explores materials, lighting, atmosphere, and visual
 direction. It includes live viewport updates, composition locking, reference
 images, frame saving, and MP4 recording.
 
-Created by **VantageInc / [@thesibilev](https://github.com/thesibilev)**.
+Created by **VantageInc / [@thesibilev](https://www.instagram.com/thesibilev/)**.
 
 ## What is included
 
