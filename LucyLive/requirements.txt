@@ -1,0 +1,4 @@
+fal-client==0.14.1
+aiortc==1.15.0
+av==16.1.0
+Pillow==12.3.0

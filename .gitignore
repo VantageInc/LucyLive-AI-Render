@@ -1,0 +1,8 @@
+LucyLive/vendor/
+LucyLive/.lucy_live_install.lock
+LucyLive/.vendor.*/
+**/__pycache__/
+*.py[cod]
+.env
+.DS_Store
+Thumbs.db
