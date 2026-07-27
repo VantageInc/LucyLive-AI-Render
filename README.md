@@ -75,9 +75,25 @@ See the [LucyLive Preview License](LICENSE.md) for the complete terms.
 
 ## Cloud processing and cost
 
-Prompts, viewport frames, and optional reference images are sent to an external
-AI service. Active sessions may be billed. Do not upload confidential content
-unless you are authorized to send it to the service.
+LucyLive connects to the
+[`decart/lucy-2-5/realtime`](https://fal.ai/models/decart/lucy-2-5/realtime/api)
+model through fal.ai. Prompts, viewport frames, and optional reference images
+are sent to external cloud services for processing.
+
+As of **July 27, 2026**, fal.ai lists Lucy 2.5 at **$0.04 per second**
+(approximately **$2.40 per minute**) of processed video. Pricing and service
+terms can change, so check the
+[current Lucy 2.5 page](https://fal.ai/lucy-2.5) before use. Charges accrue
+while a real-time session is active. Always click **Stop** when finished.
+
+If you choose **Save key**, the API key is stored as plain text in the local
+Cinema 4D preferences under `lucy_live/config.json`. On shared workstations,
+prefer the `FAL_KEY` environment variable and do not save the key in the
+plugin.
+
+Do not send confidential scenes, personal data, or reference images unless you
+are authorized to upload them. Third-party terms and privacy policies apply;
+see the [fal.ai Legal Center](https://fal.ai/legal).
 
 ## Compatibility note
 
