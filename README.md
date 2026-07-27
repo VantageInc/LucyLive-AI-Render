@@ -11,7 +11,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/VantageInc/LucyLive-AI-Render/releases/tag/v0.1.0">
+  <a href="https://github.com/VantageInc/LucyLive-AI-Render/releases/download/v0.1.0/LucyLive-v0.1.0-preview-windows.zip">
     <strong>⬇ Download LucyLive v0.1.0 Preview</strong>
   </a>
 </p>
@@ -58,7 +58,7 @@ Created by **[VantageInc](https://vantageinc.co/) / [@thesibilev](https://www.in
 
 ## Install
 
-1. Download this repository as a ZIP and extract it.
+1. Download the release ZIP using the button above and extract it.
 2. Copy the complete `LucyLive` folder to:
    `%APPDATA%\Maxon\Maxon Cinema 4D 20XX_*\plugins`
 3. Restart Cinema 4D and open **Extensions → AI Render**.
