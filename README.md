@@ -12,6 +12,18 @@
 
 ![Cinema 4D source viewport and LucyLive AI preview](assets/ai-render-editorial-compare.png)
 
+## See it in action
+
+<p align="center">
+  <a href="assets/lucylive-demo.mp4">
+    <img src="assets/lucylive-demo-poster.jpg" alt="Watch the 21-second LucyLive demo">
+  </a>
+</p>
+
+<p align="center">
+  <a href="assets/lucylive-demo.mp4">▶ Watch the 21-second demo</a>
+</p>
+
 LucyLive keeps Cinema 4D in control of the camera, scene, and motion while a
 remote generative model explores materials, lighting, atmosphere, and visual
 direction. It includes live viewport updates, composition locking, reference
