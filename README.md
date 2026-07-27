@@ -10,6 +10,12 @@
   <img alt="Platform" src="https://img.shields.io/badge/platform-Windows%2010%2F11-0ea5e9">
 </p>
 
+<p align="center">
+  <a href="https://github.com/VantageInc/LucyLive-AI-Render/releases/tag/v0.1.0">
+    <strong>⬇ Download LucyLive v0.1.0 Preview</strong>
+  </a>
+</p>
+
 ![Cinema 4D source viewport and LucyLive AI preview](assets/ai-render-editorial-compare.png)
 
 ## See it in action
