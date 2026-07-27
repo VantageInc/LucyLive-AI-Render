@@ -1,10 +1,6 @@
 # LucyLive — AI Render for Cinema 4D
 
 <p align="center">
-  <img src="LucyLive/assets/powered_by_vantage.png" alt="Powered by Vantage" width="360">
-</p>
-
-<p align="center">
   <strong>Turn your Cinema 4D viewport into a real-time AI creative preview.</strong>
 </p>
 
@@ -13,6 +9,8 @@
   <img alt="Cinema 4D" src="https://img.shields.io/badge/Cinema%204D-2024–2026-2563eb">
   <img alt="Platform" src="https://img.shields.io/badge/platform-Windows%2010%2F11-0ea5e9">
 </p>
+
+![Cinema 4D source viewport and LucyLive AI preview](assets/ai-render-editorial-compare.png)
 
 LucyLive keeps Cinema 4D in control of the camera, scene, and motion while a
 remote generative model explores materials, lighting, atmosphere, and visual
@@ -57,3 +55,9 @@ unless you are authorized to send it to the service.
 
 This is preview version **0.1.0**. It targets Cinema 4D 2024–2026 on 64-bit
 Windows and is not currently packaged for macOS.
+
+<p align="center">
+  <a href="https://vantageinc.co/">
+    <img src="LucyLive/assets/powered_by_vantage.png" alt="Powered by Vantage" width="180">
+  </a>
+</p>
