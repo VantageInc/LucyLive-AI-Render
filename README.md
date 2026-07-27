@@ -17,6 +17,12 @@ remote generative model explores materials, lighting, atmosphere, and visual
 direction. It includes live viewport updates, composition locking, reference
 images, frame saving, and MP4 recording.
 
+## More examples
+
+![Character transformed from a Cinema 4D viewport into an AI superhero preview](assets/ai-render-character.png)
+
+![Office transformed from a Cinema 4D viewport into an expressive illustrated AI preview](assets/ai-render-interior.png)
+
 Created by **[VantageInc](https://vantageinc.co/) / [@thesibilev](https://www.instagram.com/thesibilev/)**.
 
 ## What is included
