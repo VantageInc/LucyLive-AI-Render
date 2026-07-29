@@ -21,7 +21,7 @@ import c4d
 from c4d import bitmaps, documents, gui, plugins, storage
 
 
-PLUGIN_ID = 1069827  # Development ID; obtain a permanent ID before distribution.
+PLUGIN_ID = 1069521  # Permanent Maxon Plugin Café ID for LucyLiveAIRender.
 PLUGIN_NAME = "AI Render"
 MODEL_ID = "decart/lucy-2-5/realtime"
 DEFAULT_PROMPT = "cinematic product render, studio lighting"
