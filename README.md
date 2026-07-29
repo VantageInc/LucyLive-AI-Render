@@ -1,5 +1,7 @@
 # LucyLive — AI Render for Cinema 4D
 
+Created by [**VantageInc**](https://vantageinc.co/) **/** [**@thesibilev**](https://www.instagram.com/thesibilev/).
+
 <p align="center">
   <strong>Turn your Cinema 4D viewport into a real-time AI creative preview.</strong>
 </p>
@@ -40,8 +42,6 @@ images, frame saving, and MP4 recording.
 ![Character transformed from a Cinema 4D viewport into an AI superhero preview](assets/ai-render-character.png)
 
 ![Office transformed from a Cinema 4D viewport into an expressive illustrated AI preview](assets/ai-render-interior.png)
-
-Created by **[VantageInc](https://vantageinc.co/) / [@thesibilev](https://www.instagram.com/thesibilev/)**.
 
 ## What is included
 
@@ -111,3 +111,5 @@ Windows and is not currently packaged for macOS.
     <img src="LucyLive/assets/powered_by_vantage.png" alt="Powered by Vantage" width="180">
   </a>
 </p>
+
+Created by [**VantageInc**](https://vantageinc.co/) **/** [**@thesibilev**](https://www.instagram.com/thesibilev/).
