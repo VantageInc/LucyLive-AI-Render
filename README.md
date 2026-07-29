@@ -5,14 +5,14 @@
 </p>
 
 <p align="center">
-  <img alt="Version" src="https://img.shields.io/badge/version-0.1.0-7c3aed">
+  <img alt="Version" src="https://img.shields.io/badge/version-0.1.1-7c3aed">
   <img alt="Cinema 4D" src="https://img.shields.io/badge/Cinema%204D-2024–2026-2563eb">
   <img alt="Platform" src="https://img.shields.io/badge/platform-Windows%2010%2F11-0ea5e9">
 </p>
 
 <p align="center">
-  <a href="https://github.com/VantageInc/LucyLive-AI-Render/releases/download/v0.1.0/LucyLive-v0.1.0-preview-windows.zip">
-    <strong>⬇ Download LucyLive v0.1.0 Preview</strong>
+  <a href="https://github.com/VantageInc/LucyLive-AI-Render/releases/download/v0.1.1/LucyLive-v0.1.1-preview-windows.zip">
+    <strong>⬇ Download LucyLive v0.1.1 Preview</strong>
   </a>
 </p>
 
@@ -103,7 +103,7 @@ see the [fal.ai Legal Center](https://fal.ai/legal).
 
 ## Compatibility note
 
-This is preview version **0.1.0**. It targets Cinema 4D 2024–2026 on 64-bit
+This is preview version **0.1.1**. It targets Cinema 4D 2024–2026 on 64-bit
 Windows and is not currently packaged for macOS.
 
 <p align="center">
