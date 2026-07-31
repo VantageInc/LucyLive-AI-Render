@@ -11,6 +11,7 @@ import hashlib
 import json
 import math
 import os
+import platform
 import shutil
 import subprocess
 import sys
@@ -33,6 +34,7 @@ MAX_INTERVAL_MS = 5000
 UI_TIMER_MS = 33
 CAPTURE_DUTY_CYCLE = 0.65
 STATUS_POLL_SECONDS = 0.25
+WORKER_BOOT_TIMEOUT_SECONDS = 30.0
 INTERACTIVE_QUIET_SECONDS = 0.2
 # Explicit MOVE_START/CONTINUE events are authoritative. A short scheduling
 # pause under render load must not be mistaken for MOVE_END.
@@ -1360,7 +1362,17 @@ def _application_roots():
         if not raw_path:
             continue
         path = Path(str(raw_path))
-        if path.is_file() or path.suffix.lower() in (".exe", ".app"):
+        app_bundle = next(
+            (
+                candidate
+                for candidate in (path, *path.parents)
+                if candidate.suffix.lower() == ".app"
+            ),
+            None,
+        )
+        if app_bundle is not None:
+            path = app_bundle.parent
+        elif path.is_file() or path.suffix.lower() == ".exe":
             path = path.parent
         if path not in roots:
             roots.append(path)
@@ -1384,22 +1396,102 @@ def _find_c4dpy():
     return None
 
 
-def _find_worker_python():
-    """Find the lightweight CPython runtime bundled with Cinema 4D.
-
-    The WebRTC worker does not import c4d. Running it with this executable
-    avoids starting a second headless Cinema 4D instance and loading every C4D
-    plugin again. c4dpy remains a compatibility fallback for older layouts.
-    """
+def _find_lightweight_python():
+    """Find Cinema 4D's bundled CPython without starting licensed c4dpy."""
     for root in _application_roots():
-        candidates = (
-            root / "resource" / "modules" / "python" / "libs" /
-            "win64" / "python.exe",
-        )
+        if sys.platform == "darwin":
+            candidates = (
+                root / "resource" / "modules" / "python" / "libs" /
+                "python311.macos.framework" / "python",
+            )
+        else:
+            candidates = (
+                root / "resource" / "modules" / "python" / "libs" /
+                "win64" / "python.exe",
+            )
         for candidate in candidates:
             if candidate.is_file():
                 return candidate
-    return _find_c4dpy()
+    return None
+
+
+def _find_worker_python():
+    """Find a Cinema 4D-shipped interpreter for the background worker.
+
+    LucyLive's worker does not import c4d, so it can use the lightweight
+    CPython runtime without starting a second licensed Cinema 4D instance.
+    """
+    return _find_lightweight_python()
+
+
+def _is_c4dpy(interpreter):
+    try:
+        return Path(interpreter).stem.lower() == "c4dpy"
+    except (TypeError, ValueError):
+        return False
+
+
+def _python_script_command(interpreter, script, *arguments):
+    command = [str(interpreter)]
+    if _is_c4dpy(interpreter):
+        command.append("g_disableConsoleOutput=false")
+    command.append(str(script))
+    command.extend(str(argument) for argument in arguments)
+    return command
+
+
+def _dependency_platform_error():
+    """Return why this runtime cannot use an included dependency bundle."""
+    if sys.version_info[:2] != (3, 11) or sys.maxsize <= 2 ** 32:
+        return "LucyLive requires Cinema 4D 2024-2026 with 64-bit Python 3.11."
+    if sys.platform == "win32":
+        return ""
+    if sys.platform != "darwin":
+        return "LucyLive supports 64-bit Windows and Apple Silicon macOS."
+    if platform.machine().strip().lower() not in ("arm64", "aarch64"):
+        return (
+            "LucyLive for Mac requires Apple Silicon in native mode. "
+            "Turn off 'Open using Rosetta' for Cinema 4D."
+        )
+    macos_version = platform.mac_ver()[0]
+    try:
+        macos_major = int(macos_version.split(".", 1)[0])
+    except (AttributeError, TypeError, ValueError):
+        macos_major = None
+    if macos_major is not None and macos_major < 14:
+        return "LucyLive for Apple Silicon requires macOS 14 or newer."
+    return ""
+
+
+def _expected_dependency_bundle():
+    if sys.platform == "win32":
+        return "win_amd64_py311"
+    if (
+        sys.platform == "darwin"
+        and platform.machine().strip().lower() in ("arm64", "aarch64")
+    ):
+        return "macos_arm64_py311"
+    return ""
+
+
+def _dependencies_ready():
+    """Reject a ready marker produced for the other operating system."""
+    if not VENDOR_READY.is_file():
+        return False
+    expected = _expected_dependency_bundle()
+    if not expected:
+        return False
+    try:
+        marker = json.loads(VENDOR_READY.read_text(encoding="ascii"))
+    except (OSError, UnicodeError, ValueError):
+        # Versions before 0.2.0 used a plain marker and were Windows-only.
+        return expected == "win_amd64_py311"
+    return (
+        isinstance(marker, dict)
+        and marker.get("schema") == 1
+        and marker.get("python") == "3.11"
+        and marker.get("runtime") == expected
+    )
 
 
 class SourceCaptureThread(c4d.threading.C4DThread):
@@ -1792,7 +1884,7 @@ class LucySettingsDialog(gui.GeDialog):
 
     def InitValues(self):
         self.SetString(ID_API_KEY, self.owner.api_key)
-        dependency_state = ("Dependencies installed" if VENDOR_READY.is_file()
+        dependency_state = ("Dependencies installed" if _dependencies_ready()
                             else "Dependencies not installed")
         self.SetString(ID_SETTINGS_STATUS, dependency_state)
         self.SetTimer(250)
@@ -1811,9 +1903,7 @@ class LucySettingsDialog(gui.GeDialog):
             self._save_key()
         elif cid == ID_INSTALL:
             if self.owner._install_deps():
-                self.SetString(
-                    ID_SETTINGS_STATUS,
-                    "Installer opened — wait for Done in the console")
+                self.SetString(ID_SETTINGS_STATUS, self.owner.last_status)
             else:
                 self.SetString(ID_SETTINGS_STATUS, self.owner.last_status)
         elif cid == ID_SETTINGS_CLOSE:
@@ -1835,6 +1925,7 @@ class LucyDialog(gui.GeDialog):
         self.proc = None
         self.worker_log = None
         self.installer_proc = None
+        self.installer_log = None
         self.installer_started_at = 0.0
         self.settings_dialog = None
         self.api_key = ""
@@ -1917,6 +2008,7 @@ class LucyDialog(gui.GeDialog):
         self.last_output_at = 0.0
         self.next_status_poll_at = 0.0
         self.worker_stage = ""
+        self.worker_started_at = 0.0
         self.capture_thread = None
         self.capture_pending = False
         self.capture_pending_clean = False
@@ -1954,6 +2046,7 @@ class LucyDialog(gui.GeDialog):
         self.output_path = self.state / "lucy_output.jpg"
         self.telemetry_path = self.state / "telemetry.json"
         self.recording_status_path = self.state / "recording_status.json"
+        self.installer_log_path = self.root_state / "install.log"
 
     def CreateLayout(self):
         self.SetTitle("AI Render")
@@ -2143,7 +2236,7 @@ class LucyDialog(gui.GeDialog):
                       min2=MIN_INTERVAL_MS, max2=MAX_INTERVAL_MS)
         self.Enable(ID_INTERVAL, self.GetBool(ID_AUTO))
         self._update_render_time()
-        if not VENDOR_READY.is_file():
+        if not _dependencies_ready():
             self._set_status("Open Settings… and click Install deps")
         elif not (self.api_key or os.environ.get("FAL_KEY", "").strip()):
             self._set_status("Open Settings… and enter an API key")
@@ -4960,7 +5053,13 @@ class LucyDialog(gui.GeDialog):
         cfg = self._save_settings()
         if cfg is None:
             return False
-        if not VENDOR_READY.is_file():
+        if sys.platform == "darwin":
+            compatibility_error = _dependency_platform_error()
+            if compatibility_error:
+                self._set_status(compatibility_error)
+                gui.MessageDialog(compatibility_error)
+                return False
+        if not _dependencies_ready():
             self._set_status("Install dependencies in Settings… first")
             self._open_settings()
             return False
@@ -5024,10 +5123,11 @@ class LucyDialog(gui.GeDialog):
             return False
         worker = ROOT / "lucy_worker.py"
         env = os.environ.copy()
+        env.pop("PYTHONHOME", None)
         env["FAL_KEY"] = api_key
         env["PYTHONUTF8"] = "1"
         env["PYTHONIOENCODING"] = "utf-8"
-        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        env["PYTHONNOUSERSITE"] = "1"
         try:
             (self.state / "status.json").unlink()
         except OSError:
@@ -5040,11 +5140,27 @@ class LucyDialog(gui.GeDialog):
             self.worker_log.write(
                 "\n--- worker start %s ---\n" %
                 time.strftime("%Y-%m-%d %H:%M:%S"))
+            popen_options = {
+                "cwd": str(ROOT),
+                "env": env,
+                "stdout": self.worker_log,
+                "stderr": subprocess.STDOUT,
+            }
+            if os.name == "nt":
+                popen_options["creationflags"] = getattr(
+                    subprocess, "CREATE_NO_WINDOW", 0)
             self.proc = subprocess.Popen(
-                [str(interpreter), str(worker), "--state", str(self.state),
-                 "--parent-pid", str(os.getpid())],
-                cwd=str(ROOT), env=env, creationflags=creationflags,
-                stdout=self.worker_log, stderr=subprocess.STDOUT)
+                _python_script_command(
+                    interpreter,
+                    worker,
+                    "--state",
+                    self.state,
+                    "--parent-pid",
+                    os.getpid(),
+                ),
+                **popen_options
+            )
+            self.worker_started_at = time.monotonic()
         except OSError as exc:
             self.proc = None
             self._close_worker_log()
@@ -5149,6 +5265,7 @@ class LucyDialog(gui.GeDialog):
             _unlink_with_retry(
                 recording_work_path, attempts=10, delay=0.02)
         self.worker_stage = ""
+        self.worker_started_at = 0.0
         self.resync_pending_at = 0.0
         self._close_worker_log()
         if capture_joined:
@@ -5212,6 +5329,14 @@ class LucyDialog(gui.GeDialog):
                 pass
             self.worker_log = None
 
+    def _close_installer_log(self):
+        if self.installer_log is not None:
+            try:
+                self.installer_log.close()
+            except OSError:
+                pass
+            self.installer_log = None
+
     def _write_control(self):
         try:
             _atomic_write_json(self.control_path, {
@@ -5274,28 +5399,70 @@ class LucyDialog(gui.GeDialog):
         if self.installer_proc and self.installer_proc.poll() is None:
             gui.MessageDialog("The installer is already running.")
             return False
-        interpreter = _find_c4dpy()
+        compatibility_error = _dependency_platform_error()
+        if compatibility_error:
+            self._set_status(compatibility_error)
+            gui.MessageDialog(compatibility_error)
+            return False
+        interpreter = _find_lightweight_python()
         if interpreter is None:
-            message = ("c4dpy.exe was not found in the Cinema 4D installation "
-                       "folder. Run Repair in Maxon App.")
+            message = (
+                "The Cinema 4D Python runtime was not found in the "
+                "installation folder. Run Repair in Maxon App."
+            )
             self._set_status(message)
             gui.MessageDialog(message)
             return False
         installer = ROOT / "install_deps.py"
-        creationflags = getattr(subprocess, "CREATE_NEW_CONSOLE", 0)
+        installer_env = os.environ.copy()
+        installer_env.pop("PYTHONHOME", None)
+        installer_env["PYTHONNOUSERSITE"] = "1"
+        installer_env["PYTHONUTF8"] = "1"
+        installer_env["PYTHONIOENCODING"] = "utf-8"
+        popen_options = {
+            "cwd": str(ROOT),
+            "env": installer_env,
+        }
+        self._close_installer_log()
+        if os.name == "nt":
+            popen_options["creationflags"] = getattr(
+                subprocess, "CREATE_NEW_CONSOLE", 0)
+        else:
+            try:
+                self.installer_log = open(
+                    self.installer_log_path,
+                    "w",
+                    encoding="utf-8",
+                    buffering=1,
+                )
+            except OSError as exc:
+                message = "Could not open the dependency install log: %s" % exc
+                self._set_status(message)
+                gui.MessageDialog(message)
+                return False
+            popen_options["stdout"] = self.installer_log
+            popen_options["stderr"] = subprocess.STDOUT
         try:
             self.installer_proc = subprocess.Popen(
-                [str(interpreter), "g_disableConsoleOutput=false", str(installer)],
-                cwd=str(ROOT), creationflags=creationflags)
+                _python_script_command(interpreter, installer),
+                **popen_options
+            )
             self.installer_started_at = time.time()
         except OSError as exc:
             self.installer_proc = None
+            self._close_installer_log()
             self._set_status("Could not open the installer: %s" % exc)
             gui.MessageDialog(
-                "Could not start c4dpy to install the dependencies.")
+                "Could not start the Cinema 4D Python dependency installer.")
             return False
-        self._set_status(
-            "The installer opened in a separate console; restart C4D when it finishes")
+        if os.name == "nt":
+            message = (
+                "Installer opened in a separate console; restart Cinema 4D "
+                "when it finishes"
+            )
+        else:
+            message = "Installing Apple Silicon dependencies…"
+        self._set_status(message)
         return True
 
     def _poll_installer(self):
@@ -5309,15 +5476,27 @@ class LucyDialog(gui.GeDialog):
             except OSError:
                 marker_is_new = False
             if marker_is_new:
-                message = "Dependencies installed — press Enter in the console, then restart C4D"
+                if os.name == "nt":
+                    message = (
+                        "Dependencies installed — press Enter in the console, "
+                        "then restart Cinema 4D"
+                    )
+                else:
+                    message = "Dependencies installed; restart Cinema 4D"
                 self._set_status(message)
                 return message
             return None
         self.installer_proc = None
-        if result == 0 and VENDOR_READY.is_file():
+        self._close_installer_log()
+        if result == 0 and _dependencies_ready():
             message = "Dependencies installed; restart C4D"
-        else:
+        elif os.name == "nt":
             message = "Installation did not finish — check the console message"
+        else:
+            message = (
+                "Dependency installation failed (code %s). See install.log: %s"
+                % (result, self.installer_log_path)
+            )
         self._set_status(message)
         return message
 
@@ -5563,6 +5742,21 @@ class LucyDialog(gui.GeDialog):
             self._stop()
             self._set_status(error)
             return
+        if (
+            self.worker_stage == "starting"
+            and self.worker_started_at > 0.0
+            and now - self.worker_started_at >= WORKER_BOOT_TIMEOUT_SECONDS
+        ):
+            status = _read_json(self.state / "status.json", {})
+            if not status.get("stage"):
+                error = (
+                    "Worker did not initialize. Check worker.log and repair "
+                    "the Cinema 4D Python runtime if necessary."
+                )
+                self._freeze_render_timer(now)
+                self._stop()
+                self._set_status(error)
+                return
         if self.render_frames_active:
             self._tick_render_frames(now)
             document = self.render_frames_source_document
