@@ -1,7 +1,8 @@
 # Third-party notices
 
 AI Render includes pinned third-party Python packages for offline installation
-on Windows with Cinema 4D's Python 3.11 runtime.
+on 64-bit Windows and Apple Silicon macOS with Cinema 4D's Python 3.11
+runtime.
 
 The authoritative license and attribution texts are preserved inside the
 bundled wheel files and, in the ready-to-run delivery, under the matching
