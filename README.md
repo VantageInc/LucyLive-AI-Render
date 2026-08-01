@@ -7,18 +7,18 @@ Created by [**VantageInc**](https://vantageinc.co/) **/** [**@thesibilev**](http
 </p>
 
 <p align="center">
-  <img alt="Version" src="https://img.shields.io/badge/version-0.2.0-7c3aed">
+  <img alt="Version" src="https://img.shields.io/badge/version-0.2.2-7c3aed">
   <img alt="Cinema 4D" src="https://img.shields.io/badge/Cinema%204D-2024–2026-2563eb">
   <img alt="Windows" src="https://img.shields.io/badge/Windows-10%2F11-0ea5e9">
   <img alt="Apple Silicon" src="https://img.shields.io/badge/macOS-Apple%20Silicon-111827">
 </p>
 
 <p align="center">
-  <a href="https://github.com/VantageInc/LucyLive-AI-Render/releases/download/v0.2.0/LucyLive-v0.2.0-preview-windows.zip">
+  <a href="https://github.com/VantageInc/LucyLive-AI-Render/releases/download/v0.2.2/LucyLive-v0.2.2-preview-windows.zip">
     <strong>⬇ Windows</strong>
   </a>
   &nbsp;&nbsp;·&nbsp;&nbsp;
-  <a href="https://github.com/VantageInc/LucyLive-AI-Render/releases/download/v0.2.0/LucyLive-v0.2.0-preview-macos-apple-silicon.zip">
+  <a href="https://github.com/VantageInc/LucyLive-AI-Render/releases/download/v0.2.2/LucyLive-v0.2.2-preview-macos-apple-silicon.zip">
     <strong>⬇ Apple Silicon Mac — experimental</strong>
   </a>
 </p>
@@ -116,7 +116,7 @@ see the [fal.ai Legal Center](https://fal.ai/legal).
 
 ## Compatibility note
 
-This is preview version **0.2.0**. Windows is the verified platform. The native
+This is preview version **0.2.2**. Windows is the verified platform. The native
 Apple Silicon package is experimental until the full Cinema 4D workflow has
 passed validation on physical Mac hardware. Intel Macs and Rosetta mode are not
 supported.

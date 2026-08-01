@@ -43,6 +43,7 @@ INTERACTIVE_LOST_END_SECONDS = 1.0
 # Keep drag sampling responsive without forcing that expensive operation into
 # every 50 ms UI slice.
 INTERACTIVE_INTERVAL_MS = 125
+DRAG_TRACE_EVENT_LIMIT = 1024
 IDLE_SAFETY_REFRESH_SECONDS = 2.0
 AUTO_RESYNC_THRESHOLD = 0.26
 AUTO_RESYNC_DELAY_SECONDS = 0.35
@@ -1130,7 +1131,7 @@ def _non_matrix_dirty_signature(nodes):
     return tuple(result) if supported else None
 
 
-def _copy_node_matrix(source, target, required=False):
+def _copy_node_matrix(source, target, required=False, changed=None):
     """Copy one native transform without mutating the live source wrapper."""
     get_matrix = getattr(source, "GetMg", None)
     set_matrix = getattr(target, "SetMg", None)
@@ -1147,6 +1148,8 @@ def _copy_node_matrix(source, target, required=False):
             return not required
         if source_signature != target_signature:
             set_matrix(source_matrix)
+            if changed is not None:
+                changed.append(True)
             message = getattr(target, "Message", None)
             update_message = getattr(c4d, "MSG_UPDATE", None)
             if update_message is not None and callable(message):
@@ -1257,7 +1260,9 @@ class InteractiveSnapshot:
                  clean_feed, follow_view, view_index, scene_camera,
                  view_projection, topology_signature, source_nodes,
                  snapshot_nodes, non_matrix_signature,
-                 hierarchy_revision, document_non_matrix_revision):
+                 hierarchy_revision, document_non_matrix_revision,
+                 object_sync_ready, camera_signature,
+                 selected_object_signature):
         self.source_document = source_document
         self.document = document
         self.render_data = render_data
@@ -1273,6 +1278,11 @@ class InteractiveSnapshot:
         self.non_matrix_signature = non_matrix_signature
         self.hierarchy_revision = hierarchy_revision
         self.document_non_matrix_revision = document_non_matrix_revision
+        self.object_sync_ready = bool(object_sync_ready)
+        self.camera_signature = camera_signature
+        self.selected_object_signature = selected_object_signature
+        self.pose_evaluation_required = False
+        self.pose_matrix_change_count = 0
         self.retired = False
 
 
@@ -1321,6 +1331,90 @@ def _basedraw_camera(document, basedraw):
             except (AttributeError, ReferenceError, RuntimeError):
                 camera = None
     return camera
+
+
+def _view_camera_transform_signature(document, basedraw):
+    """Return only transforms which identify editor/scene camera motion."""
+    if basedraw is None:
+        return None
+    camera = _basedraw_camera(document, basedraw)
+    result = []
+    for label, owner, getter_name in (
+            ("view", basedraw, "GetMg"),
+            ("base", basedraw, "GetBaseMatrix"),
+            ("camera", camera, "GetMg")):
+        if owner is None:
+            continue
+        getter = getattr(owner, getter_name, None)
+        if not callable(getter):
+            continue
+        try:
+            signature = _matrix_signature(getter())
+        except (AttributeError, ReferenceError, RuntimeError, TypeError):
+            signature = None
+        if signature is not None:
+            result.append((label, signature))
+    get_view_parameter = getattr(basedraw, "GetViewParameter", None)
+    if callable(get_view_parameter):
+        try:
+            view_parameter = _value_signature(get_view_parameter())
+        except (AttributeError, ReferenceError, RuntimeError, TypeError,
+                ValueError):
+            view_parameter = None
+        if view_parameter is not None:
+            result.append(("view-parameter", view_parameter))
+    if camera is not None:
+        for name in (
+                "CAMERA_PROJECTION",
+                "CAMERAOBJECT_APERTURE",
+                "CAMERA_FOCUS",
+                "CAMERA_ZOOM"):
+            parameter_id = getattr(c4d, name, None)
+            if parameter_id is None:
+                continue
+            try:
+                value = _value_signature(camera[parameter_id])
+            except (AttributeError, KeyError, ReferenceError, RuntimeError,
+                    TypeError, ValueError):
+                continue
+            result.append((name, value))
+    return tuple(result) if result else None
+
+
+def _selected_object_matrix_signature(document, excluded=None, limit=64):
+    """Return selected transforms, excluding the camera driven by the view."""
+    objects = None
+    get_active_objects = getattr(document, "GetActiveObjects", None)
+    if callable(get_active_objects):
+        try:
+            objects = list(get_active_objects(0) or [])
+        except (AttributeError, ReferenceError, RuntimeError, TypeError):
+            return None
+    else:
+        get_active_object = getattr(document, "GetActiveObject", None)
+        if not callable(get_active_object):
+            return None
+        try:
+            active_object = get_active_object()
+        except (AttributeError, ReferenceError, RuntimeError):
+            return None
+        objects = [] if active_object is None else [active_object]
+
+    result = []
+    for node in objects[:max(0, int(limit))]:
+        if excluded is not None and _same_sdk_object(node, excluded):
+            continue
+        get_matrix = getattr(node, "GetMg", None)
+        if not callable(get_matrix):
+            return None
+        try:
+            signature = _matrix_signature(get_matrix())
+        except (AttributeError, ReferenceError, RuntimeError, TypeError):
+            return None
+        if signature is None:
+            return None
+        result.append((_object_type_signature(node), signature))
+    return tuple(result)
 
 
 def _render_view_label(document, follow_mode=FOLLOW_RENDER_VIEW):
@@ -1499,7 +1593,8 @@ class SourceCaptureThread(c4d.threading.C4DThread):
 
     def __init__(self, document, render_data, bitmap, target, source_label,
                  interactive=False, clean_feed=False, isolated=False,
-                 source_view=None, source_view_state=()):
+                 source_view=None, source_view_state=(), trace_hook=None,
+                 evaluate_private_pose=False, pose_matrix_change_count=0):
         super().__init__()
         self.document = document
         self.render_data = render_data
@@ -1513,6 +1608,10 @@ class SourceCaptureThread(c4d.threading.C4DThread):
         # them only after End() has joined this render on Cinema's UI thread.
         self.source_view = source_view
         self.source_view_state = tuple(source_view_state or ())
+        self.trace_hook = trace_hook
+        self.evaluate_private_pose = bool(evaluate_private_pose)
+        self.pose_matrix_change_count = max(
+            0, int(pose_matrix_change_count))
         self.success = False
         self.cancelled = False
         self.error = ""
@@ -1521,19 +1620,73 @@ class SourceCaptureThread(c4d.threading.C4DThread):
         self.finished_at = 0.0
         self.main_completed = False
 
-    def Main(self):
+    def _trace(self, event, **fields):
+        hook = self.trace_hook
+        if not callable(hook):
+            return
         try:
-            # Interactive matrices are synchronized into a reusable private
-            # document between frames. Omitting NODOCUMENTCLONE makes
-            # RenderDocument take its own immutable snapshot for each render.
+            hook(event, **fields)
+        except Exception:
+            # Diagnostics must never change capture behavior.
+            pass
+
+    def Main(self):
+        render_started = time.monotonic()
+        result = None
+        try:
+            # Every isolated capture already owns a private document. The
+            # dialog never mutates an interactive snapshot while this thread
+            # owns it, so a second RenderDocument clone is both redundant and
+            # liable to wait for Cinema's viewport/draw lock until mouse-up.
             flags = c4d.RENDERFLAGS_EXTERNAL
-            if self.isolated and not self.interactive:
-                # _make_clean_snapshot already owns a private immutable clone.
-                # Final/sequence captures do not mutate it while rendering.
+            if self.isolated:
                 flags |= getattr(c4d, "RENDERFLAGS_NODOCUMENTCLONE", 0)
-            # An interactive cache is intentionally reused between samples.
-            # Never evaluate XPresso directly on that graph: Cinema must make
-            # its own render clone for every in-drag frame.
+            # Interactive graph synchronization happens only after this thread
+            # has been joined. The final settled frame still builds a fresh
+            # full clone, so expressions and non-matrix edits are re-evaluated.
+            no_clone_flag = getattr(c4d, "RENDERFLAGS_NODOCUMENTCLONE", 0)
+            if self.isolated and self.evaluate_private_pose:
+                execute_passes = getattr(self.document, "ExecutePasses", None)
+                if not callable(execute_passes):
+                    self.error = "Private pose evaluation is unavailable"
+                    return
+                evaluation_started = time.monotonic()
+                evaluation_result = None
+                evaluation_succeeded = False
+                self._trace(
+                    "private_eval_enter",
+                    changed_nodes=self.pose_matrix_change_count,
+                )
+                try:
+                    evaluation_result = execute_passes(
+                        self.Get(), False, True, True,
+                        getattr(
+                            c4d, "BUILDFLAGS_EXTERNALRENDERER",
+                            getattr(c4d, "BUILDFLAGS_NONE", 0)),
+                    )
+                    evaluation_succeeded = evaluation_result is not False
+                finally:
+                    self._trace(
+                        "private_eval_exit",
+                        changed_nodes=self.pose_matrix_change_count,
+                        success=evaluation_succeeded,
+                        duration_ms=round(max(
+                            0.0,
+                            time.monotonic() - evaluation_started,
+                        ) * 1000.0, 3),
+                    )
+                if self.TestBreak():
+                    self.cancelled = True
+                    return
+                if evaluation_result is False:
+                    self.error = "Private pose evaluation failed"
+                    return
+            self._trace(
+                "render_enter",
+                interactive=self.interactive,
+                isolated=self.isolated,
+                no_document_clone=bool(flags & no_clone_flag),
+            )
             result = documents.RenderDocument(
                 self.document,
                 self.render_data.GetDataInstance(),
@@ -1552,9 +1705,18 @@ class SourceCaptureThread(c4d.threading.C4DThread):
             self.error = "Viewport capture exception: %s" % exc
         finally:
             self.main_completed = True
+            self._trace(
+                "render_exit",
+                interactive=self.interactive,
+                success=self.success,
+                cancelled=self.cancelled,
+                result=result,
+                duration_ms=round(max(
+                    0.0, time.monotonic() - render_started) * 1000.0, 3),
+            )
             # GeDialog.Timer can be starved while the native Move tool owns the
             # mouse. SpecialEventAdd is Cinema's supported thread-to-main-thread
-            # bridge and lets CoreMessage harvest this completed frame safely.
+            # bridge and lets CoreMessage observe this completed frame.
             post_event = getattr(c4d, "SpecialEventAdd", None)
             if callable(post_event):
                 try:
@@ -1983,6 +2145,7 @@ class LucyDialog(gui.GeDialog):
         self.retired_sequence_directories = []
         self.render_frames_abort_message = ""
         self.published_source_revision = 0
+        self.control_sync_pending = False
         self.ai_output_sequence = 0
         self.timer_busy = False
         self.render_timer_started_at = 0.0
@@ -2017,16 +2180,24 @@ class LucyDialog(gui.GeDialog):
         self.resolution_capture_pending = False
         self.editor_move_active = False
         self.last_editor_move_at = 0.0
+        self.interactive_camera_start_signature = None
         self.interactive_until = 0.0
         self.interactive_next_capture_at = 0.0
         self.interactive_output_poll_at = 0.0
         self.interactive_pending_phase = None
         self.realtime_event_queued = False
         self.realtime_pump_busy = False
+        self.unsafe_completion_retry_used = False
+        self.unsafe_completion_wait_retry_used = False
+        self.drag_trace_active = False
+        self.drag_trace_started_at = 0.0
+        self.drag_trace_source_revision = 0
+        self.drag_trace_events = []
         self.last_scene_signature = None
         self.last_observed_scene_signature = None
         self.source_activity_generation = 0
         self.last_settled_fingerprint = None
+        self.last_settled_camera_signature = None
         self.resync_pending_at = 0.0
         self.last_auto_resync_at = 0.0
         self.followed_render_views = []
@@ -2047,6 +2218,7 @@ class LucyDialog(gui.GeDialog):
         self.telemetry_path = self.state / "telemetry.json"
         self.recording_status_path = self.state / "recording_status.json"
         self.installer_log_path = self.root_state / "install.log"
+        self.drag_trace_path = self.root_state / "last_drag_trace.json"
 
     def CreateLayout(self):
         self.SetTitle("AI Render")
@@ -2360,16 +2532,20 @@ class LucyDialog(gui.GeDialog):
 
     def _clear_live_capture_requests(self):
         """Drop queued live-view captures while an animation feed owns input."""
+        self._discard_drag_trace()
         self.capture_pending = False
         self.capture_pending_clean = False
         self.manual_capture_pending = False
         self.final_clean_pending = False
         self.resolution_capture_pending = False
         self.editor_move_active = False
+        self.interactive_camera_start_signature = None
         self.interactive_until = 0.0
         self.interactive_output_poll_at = 0.0
         self.interactive_pending_phase = None
         self.realtime_event_queued = False
+        self.unsafe_completion_retry_used = False
+        self.unsafe_completion_wait_retry_used = False
 
     @staticmethod
     def _native_play_active(document):
@@ -3482,6 +3658,55 @@ class LucyDialog(gui.GeDialog):
             self.resync_cut_armed = True
         return changed
 
+    def _current_camera_motion_signature(self, document=None):
+        """Return the transform/lens state which drives the captured view."""
+        source = (documents.GetActiveDocument()
+                  if document is None else document)
+        if not _sdk_object_alive(source):
+            return None
+        view = _source_basedraw(source, self.follow_view)
+        return _view_camera_transform_signature(source, view)
+
+    def _begin_interactive_camera_motion(self, document=None):
+        """Remember the last settled camera so MOVE_END can detect a cut."""
+        current = self._current_camera_motion_signature(document)
+        self.interactive_camera_start_signature = (
+            self.last_settled_camera_signature
+            if self.last_settled_camera_signature is not None
+            else current)
+        return current
+
+    def _finish_interactive_camera_motion(self, document=None):
+        """Arm one settled-frame resync when this drag changed the camera."""
+        current = self._current_camera_motion_signature(document)
+        start = self.interactive_camera_start_signature
+        self.interactive_camera_start_signature = None
+        moved = bool(
+            start is not None and current is not None and current != start)
+        if moved:
+            # _register_settled_frame still applies its independent RGB cut
+            # threshold, so large object moves do not reconnect the model.
+            self.resync_cut_armed = True
+        return moved
+
+    def _note_settled_camera_signature(self, current):
+        """Accept the camera state that belongs to one published bitmap."""
+        previous = self.last_settled_camera_signature
+        if current is None:
+            # A transient dead BaseDraw/editor-camera wrapper must not erase a
+            # valid baseline and make the next real camera change invisible.
+            return previous
+        if (previous is not None and current is not None and
+                current != previous):
+            self.resync_cut_armed = True
+        self.last_settled_camera_signature = current
+        return current
+
+    def _note_settled_camera(self, document=None):
+        """Arm a cut from settled camera state even when MOVE events vanish."""
+        return self._note_settled_camera_signature(
+            self._current_camera_motion_signature(document))
+
     def _prepare_source_document(self, document):
         """Switch capture ownership safely when the active document changes."""
         if not _sdk_object_alive(document):
@@ -3547,19 +3772,30 @@ class LucyDialog(gui.GeDialog):
     def _remember_interactive_snapshot(
             self, source_document, render_document, render_data, active_rect,
             clean_feed):
-        """Adopt a fresh clone only when its hierarchy is safely pairable."""
+        """Adopt a private clone with independent camera/object capabilities."""
         source_view = _source_basedraw(source_document, self.follow_view)
         view_index = self._basedraw_index(source_document, source_view)
-        snapshot_view = self._interactive_snapshot_view(
-            render_document, view_index)
+        # Hardware Preview consumes the clone's Render View. Reacquire that
+        # wrapper instead of requiring Python identity with the live BaseDraw;
+        # Cinema may recreate BaseDraw wrappers while the viewport is edited.
+        snapshot_view = _exact_basedraw(render_document, "GetRenderBaseDraw")
+        if snapshot_view is None:
+            snapshot_view = self._interactive_snapshot_view(
+                render_document, view_index)
         source_entries = _document_object_entries(source_document)
         snapshot_entries = _document_object_entries(render_document)
         source_topology = _object_topology_signature(source_entries)
         snapshot_topology = _object_topology_signature(snapshot_entries)
-        if (source_view is None or snapshot_view is None or
-                source_topology is None or
-                source_topology != snapshot_topology):
+        if source_view is None or snapshot_view is None:
             return None
+        object_sync_ready = bool(
+            source_topology is not None and
+            source_topology == snapshot_topology)
+        source_nodes = (tuple(entry[2] for entry in source_entries)
+                        if object_sync_ready else ())
+        snapshot_nodes = (tuple(entry[2] for entry in snapshot_entries)
+                          if object_sync_ready else ())
+        scene_camera = _basedraw_scene_camera(source_document, source_view)
         state = InteractiveSnapshot(
             source_document=source_document,
             document=render_document,
@@ -3568,17 +3804,22 @@ class LucyDialog(gui.GeDialog):
             clean_feed=clean_feed,
             follow_view=self.follow_view,
             view_index=view_index,
-            scene_camera=_basedraw_scene_camera(
-                source_document, source_view),
+            scene_camera=scene_camera,
             view_projection=_basedraw_projection_value(source_view),
-            topology_signature=source_topology,
-            source_nodes=tuple(entry[2] for entry in source_entries),
-            snapshot_nodes=tuple(entry[2] for entry in snapshot_entries),
+            topology_signature=(source_topology
+                                if object_sync_ready else None),
+            source_nodes=source_nodes,
+            snapshot_nodes=snapshot_nodes,
             non_matrix_signature=_non_matrix_dirty_signature(
-                entry[2] for entry in source_entries),
+                source_nodes) if object_sync_ready else None,
             hierarchy_revision=_hierarchy_revision(source_document),
             document_non_matrix_revision=_document_non_matrix_revision(
                 source_document),
+            object_sync_ready=object_sync_ready,
+            camera_signature=_view_camera_transform_signature(
+                source_document, source_view),
+            selected_object_signature=_selected_object_matrix_signature(
+                source_document, excluded=scene_camera),
         )
         self._retire_interactive_snapshot()
         self.interactive_snapshot = state
@@ -3604,7 +3845,10 @@ class LucyDialog(gui.GeDialog):
         source_view = _source_basedraw(source_document, self.follow_view)
         view_index = self._basedraw_index(source_document, source_view)
         scene_camera = _basedraw_scene_camera(source_document, source_view)
-        if (source_view is None or view_index != state.view_index or
+        view_changed = bool(
+            state.view_index is not None and view_index is not None and
+            view_index != state.view_index)
+        if (source_view is None or view_changed or
                 _basedraw_projection_value(source_view) !=
                 state.view_projection or
                 not _same_sdk_object(scene_camera, state.scene_camera)):
@@ -3613,14 +3857,34 @@ class LucyDialog(gui.GeDialog):
             self._retire_interactive_snapshot(state)
             return None
 
-        snapshot_view = self._interactive_snapshot_view(
-            state.document, state.view_index)
+        snapshot_view = _exact_basedraw(
+            state.document, "GetRenderBaseDraw")
+        if snapshot_view is None:
+            snapshot_view = self._interactive_snapshot_view(
+                state.document, state.view_index)
+        if snapshot_view is None:
+            self._retire_interactive_snapshot(state)
+            return None
+
+        camera_signature = _view_camera_transform_signature(
+            source_document, source_view)
+        camera_changed = bool(
+            state.camera_signature is not None and
+            camera_signature is not None and
+            camera_signature != state.camera_signature)
+        selected_signature = _selected_object_matrix_signature(
+            source_document, excluded=scene_camera)
+        selected_unchanged = bool(
+            state.selected_object_signature is not None and
+            selected_signature is not None and
+            selected_signature == state.selected_object_signature)
+
         current_hierarchy_revision = _hierarchy_revision(source_document)
         hierarchy_known_unchanged = bool(
             state.hierarchy_revision is not None and
             current_hierarchy_revision is not None and
             current_hierarchy_revision == state.hierarchy_revision)
-        if not hierarchy_known_unchanged:
+        if state.object_sync_ready and not hierarchy_known_unchanged:
             source_entries = _document_object_entries(source_document)
             source_topology = _object_topology_signature(source_entries)
             if (source_topology is None or
@@ -3633,8 +3897,56 @@ class LucyDialog(gui.GeDialog):
                 return None
             state.source_nodes = tuple(entry[2] for entry in source_entries)
             state.hierarchy_revision = current_hierarchy_revision
+        elif not state.object_sync_ready:
+            # Without object pairing, hierarchy validity must be positively
+            # known. Missing/changed counters cannot prove the clone is current.
+            if (state.hierarchy_revision is None or
+                    current_hierarchy_revision is None or
+                    current_hierarchy_revision != state.hierarchy_revision):
+                self._retire_interactive_snapshot(state)
+                return None
 
-        if state.document_non_matrix_revision is not None:
+        # Cinema's native Move tool can advance DATA/DESCRIPTION together with
+        # a matrix. Detect those deltas without mutating the snapshot yet so
+        # unrelated parameter edits still fail closed below.
+        matrix_delta_indices = set()
+        matrix_deltas_known = True
+        if state.object_sync_ready:
+            for index, (source_node, snapshot_node) in enumerate(zip(
+                    state.source_nodes, state.snapshot_nodes)):
+                if _same_sdk_object(source_node, scene_camera):
+                    continue
+                source_getter = getattr(source_node, "GetMg", None)
+                snapshot_getter = getattr(snapshot_node, "GetMg", None)
+                if (not callable(source_getter) or
+                        not callable(snapshot_getter)):
+                    matrix_deltas_known = False
+                    break
+                try:
+                    source_matrix = _matrix_signature(source_getter())
+                    snapshot_matrix = _matrix_signature(snapshot_getter())
+                except (AttributeError, ReferenceError, RuntimeError,
+                        TypeError, ValueError):
+                    matrix_deltas_known = False
+                    break
+                if source_matrix is None or snapshot_matrix is None:
+                    matrix_deltas_known = False
+                    break
+                if source_matrix != snapshot_matrix:
+                    matrix_delta_indices.add(index)
+        selected_changed = bool(
+            state.selected_object_signature is not None and
+            selected_signature is not None and
+            selected_signature != state.selected_object_signature)
+        selected_transform_drag = bool(
+            self.editor_move_active and selected_changed and
+            matrix_deltas_known and matrix_delta_indices)
+
+        non_matrix_changed = False
+        revision_change_mask = None
+        dirty_delta_indices = None
+        if (state.object_sync_ready and
+                state.document_non_matrix_revision is not None):
             current_document_revision = _document_non_matrix_revision(
                 source_document)
             non_matrix_changed = bool(
@@ -3642,22 +3954,84 @@ class LucyDialog(gui.GeDialog):
                 state.document_non_matrix_revision)
             if non_matrix_changed:
                 previous = state.document_non_matrix_revision
+                revision_change_mask = (
+                    tuple(current != old for current, old in zip(
+                        current_document_revision, previous))
+                    if (current_document_revision is not None and
+                        len(current_document_revision) == len(previous))
+                    else None)
                 object_revision_only = bool(
-                    current_document_revision is not None and
-                    len(current_document_revision) == len(previous) and
-                    current_document_revision[1:] == previous[1:])
-                if object_revision_only:
+                    revision_change_mask is not None and
+                    revision_change_mask[0] and
+                    not any(revision_change_mask[1:]))
+                object_or_rig_revision_only = bool(
+                    object_revision_only or
+                    (selected_transform_drag and
+                     revision_change_mask is not None and
+                     any(revision_change_mask[:2]) and
+                     not any(revision_change_mask[2:])))
+                self._trace_drag(
+                    "snapshot_revision_classified",
+                    object_revision=bool(
+                        revision_change_mask is not None and
+                        revision_change_mask[0]),
+                    tag_revision=bool(
+                        revision_change_mask is not None and
+                        revision_change_mask[1]),
+                    material_revision=bool(
+                        revision_change_mask is not None and
+                        revision_change_mask[2]),
+                    shader_revision=bool(
+                        revision_change_mask is not None and
+                        revision_change_mask[3]),
+                    selected_transform_drag=selected_transform_drag,
+                    object_or_rig_only=object_or_rig_revision_only,
+                )
+                if object_or_rig_revision_only:
                     current_non_matrix = _non_matrix_dirty_signature(
                         state.source_nodes)
                     non_matrix_changed = bool(
                         state.non_matrix_signature is None or
                         current_non_matrix is None or
                         current_non_matrix != state.non_matrix_signature)
+                    if (state.non_matrix_signature is not None and
+                            current_non_matrix is not None and
+                            len(current_non_matrix) ==
+                            len(state.non_matrix_signature)):
+                        dirty_delta_indices = {
+                            index for index, (previous_dirty, current_dirty)
+                            in enumerate(zip(
+                                state.non_matrix_signature,
+                                current_non_matrix))
+                            if previous_dirty != current_dirty
+                        }
+                    coupled_transform_dirty = bool(selected_transform_drag)
+                    if non_matrix_changed and coupled_transform_dirty:
+                        # Transform fields are represented by Mg and have
+                        # a positive selected-object delta. Expressions, Skin,
+                        # constraints, and generators can dirty dependent nodes
+                        # and their tags while their own matrix stays fixed, so
+                        # adopt this object/rig-only set for the explicit
+                        # gesture. Material/shader revisions remain strict.
+                        non_matrix_changed = False
+                        self._trace_drag(
+                            "transform_dirty_adopted",
+                            dirty_nodes=(
+                                len(dirty_delta_indices)
+                                if dirty_delta_indices is not None else None),
+                            matrix_nodes=len(matrix_delta_indices),
+                            dependent_dirty_nodes=(
+                                len(dirty_delta_indices - matrix_delta_indices)
+                                if dirty_delta_indices is not None else None),
+                            tag_revision=bool(
+                                revision_change_mask is not None and
+                                revision_change_mask[1]),
+                        )
                     if not non_matrix_changed:
                         state.document_non_matrix_revision = (
                             current_document_revision)
                         state.non_matrix_signature = current_non_matrix
-        else:
+        elif state.object_sync_ready:
             current_non_matrix = _non_matrix_dirty_signature(
                 state.source_nodes)
             non_matrix_changed = bool(
@@ -3666,15 +4040,73 @@ class LucyDialog(gui.GeDialog):
         if non_matrix_changed:
             # Point edits, primitive/deformer parameters, tags and materials
             # need one fresh clone; matrix-only motion stays on the fast path.
+            self._trace_drag(
+                "snapshot_rejected",
+                reason="non_matrix_dirty",
+                selected_changed=selected_changed,
+                matrix_nodes=len(matrix_delta_indices),
+                object_revision=bool(
+                    revision_change_mask is not None and
+                    revision_change_mask[0]),
+                tag_revision=bool(
+                    revision_change_mask is not None and
+                    revision_change_mask[1]),
+                material_revision=bool(
+                    revision_change_mask is not None and
+                    revision_change_mask[2]),
+                shader_revision=bool(
+                    revision_change_mask is not None and
+                    revision_change_mask[3]),
+                dirty_signature_known=bool(
+                    state.non_matrix_signature is not None),
+                dirty_nodes=(
+                    len(dirty_delta_indices)
+                    if dirty_delta_indices is not None else None),
+            )
             self._retire_interactive_snapshot(state)
             return None
 
-        for source_node, snapshot_node in zip(
-                state.source_nodes, state.snapshot_nodes):
-            if not _copy_node_matrix(
-                    source_node, snapshot_node, required=True):
+        if not state.object_sync_ready:
+            current_document_revision = _document_non_matrix_revision(
+                source_document)
+            previous_revision = state.document_non_matrix_revision
+            if (previous_revision is None or
+                    current_document_revision is None or
+                    current_document_revision != previous_revision):
+                # Broad scene revisions cover unselected objects, materials,
+                # tags and shaders which a camera-only clone cannot mirror.
                 self._retire_interactive_snapshot(state)
                 return None
+
+            # Without a source/clone object map only a proven camera movement is
+            # safe. A selected-object change retires the stale geometry instead
+            # of ever publishing it as an interactive frame.
+            if not selected_unchanged:
+                self._retire_interactive_snapshot(state)
+                return None
+            if not camera_changed:
+                return None
+
+        object_matrix_changes = []
+        if state.object_sync_ready:
+            for source_node, snapshot_node in zip(
+                    state.source_nodes, state.snapshot_nodes):
+                change_sink = (
+                    None if _same_sdk_object(source_node, scene_camera)
+                    else object_matrix_changes)
+                if not _copy_node_matrix(
+                        source_node, snapshot_node, required=True,
+                        changed=change_sink):
+                    self._retire_interactive_snapshot(state)
+                    return None
+        state.pose_matrix_change_count = len(object_matrix_changes)
+        state.pose_evaluation_required = bool(object_matrix_changes)
+        if selected_changed or object_matrix_changes:
+            self._trace_drag(
+                "object_matrix_sync",
+                changed_nodes=len(object_matrix_changes),
+                selected_changed=selected_changed,
+            )
         if not _copy_basedraw_state(source_view, snapshot_view):
             self._retire_interactive_snapshot(state)
             return None
@@ -3690,6 +4122,10 @@ class LucyDialog(gui.GeDialog):
         if not _copy_camera_parameters(source_camera, snapshot_camera):
             self._retire_interactive_snapshot(state)
             return None
+        state.camera_signature = camera_signature
+        state.selected_object_signature = selected_signature
+        if view_index is not None:
+            state.view_index = view_index
 
         # RenderDocument can alter detached render/view flags. Restore our
         # isolated policy only after the previous C4DThread has been joined.
@@ -3958,10 +4394,11 @@ class LucyDialog(gui.GeDialog):
         if (not allow_reset or difference is None or
                 not self.auto_resync or
                 not hard_cut or
-                difference < AUTO_RESYNC_THRESHOLD or
-                now - self.last_auto_resync_at < AUTO_RESYNC_COOLDOWN_SECONDS):
+                difference < AUTO_RESYNC_THRESHOLD):
             return difference
-        requested_at = now + AUTO_RESYNC_DELAY_SECONDS
+        requested_at = max(
+            now + AUTO_RESYNC_DELAY_SECONDS,
+            self.last_auto_resync_at + AUTO_RESYNC_COOLDOWN_SECONDS)
         if self.resync_pending_at <= 0.0:
             self.resync_pending_at = requested_at
             self._set_status(
@@ -3977,6 +4414,12 @@ class LucyDialog(gui.GeDialog):
         if not self.running or not self.auto_resync:
             self.resync_pending_at = 0.0
             return False
+        if self.control_sync_pending:
+            # Do not tear down the current worker until the authoritative
+            # final source revision has reached its control channel. Timer
+            # retries that lightweight write independently of rendering.
+            self.resync_pending_at = now + UI_TIMER_MS / 1000.0
+            return False
         if self.recording_active or self.recording_stopping:
             self.resync_pending_at = now + STATUS_POLL_SECONDS
             return False
@@ -3984,7 +4427,9 @@ class LucyDialog(gui.GeDialog):
                 now < self.interactive_until or self.final_clean_pending):
             return False
         if now - self.last_auto_resync_at < AUTO_RESYNC_COOLDOWN_SECONDS:
-            self.resync_pending_at = 0.0
+            self.resync_pending_at = max(
+                self.resync_pending_at,
+                self.last_auto_resync_at + AUTO_RESYNC_COOLDOWN_SECONDS)
             return False
         if self.worker_stage != "receiving":
             self.resync_pending_at = now + STATUS_POLL_SECONDS
@@ -4005,11 +4450,15 @@ class LucyDialog(gui.GeDialog):
         doc = self.source_document
         if doc is None:
             self._set_status("No active document")
+            if interactive:
+                self._trace_drag("capture_rejected", reason="no_document")
             return False
         if self.capture_thread is not None:
             self.capture_pending = True
             if clean_feed:
                 self.capture_pending_clean = True
+            if interactive:
+                self._trace_drag("capture_busy")
             return False
         active_rect = self._active_rect(doc)
         _active_x, _active_y, width, height = active_rect
@@ -4019,6 +4468,15 @@ class LucyDialog(gui.GeDialog):
             return False
         use_clean_feed = (self.GetBool(ID_CLEAN_FEED)
                           if clean_feed is None else bool(clean_feed))
+        if interactive:
+            self._trace_drag(
+                "capture_attempt",
+                now=now,
+                direct_move=bool(direct_move),
+                clean_feed=use_clean_feed,
+                width=int(width),
+                height=int(height),
+            )
         # Every AI source frame must come from a private document. A direct
         # MOVE callback may reuse an already joined private snapshot, but it
         # must never fall back to the live BaseDocument: Hardware Preview also
@@ -4032,9 +4490,18 @@ class LucyDialog(gui.GeDialog):
         if interactive:
             interactive_state = self._reuse_interactive_snapshot(
                 doc, active_rect, use_clean_feed)
+            self._trace_drag(
+                "snapshot_cache_hit" if interactive_state is not None
+                else "snapshot_cache_miss",
+                now=now,
+                direct_move=bool(direct_move),
+            )
             if interactive_state is None:
                 if direct_move_requires_cache:
                     self.capture_pending = True
+                    self._trace_drag(
+                        "capture_deferred", now=now,
+                        reason="direct_move_snapshot_miss")
                     self._post_realtime_event()
                     return False
                 else:
@@ -4057,6 +4524,9 @@ class LucyDialog(gui.GeDialog):
                             self._remember_interactive_snapshot(
                                 doc, render_doc, rd, active_rect,
                                 use_clean_feed))
+                        self._trace_drag(
+                            "snapshot_seeded", now=now,
+                            success=interactive_state is not None)
         # A final/idle render always creates its own fresh clone below. Keep the
         # previous joined drag cache alive until that clone succeeds; otherwise
         # a drag which interrupts an idle render would lose its fast path.
@@ -4079,12 +4549,21 @@ class LucyDialog(gui.GeDialog):
             _render_view_label(doc, self.follow_view),
             interactive=interactive,
             clean_feed=use_clean_feed,
-            isolated=isolated)
+            isolated=isolated,
+            trace_hook=self._trace_drag if interactive else None,
+            evaluate_private_pose=bool(
+                interactive_state is not None and
+                interactive_state.pose_evaluation_required),
+            pose_matrix_change_count=(
+                interactive_state.pose_matrix_change_count
+                if interactive_state is not None else 0))
         thread.scene_signature = self._scene_signature(doc)
         thread.semantic_scene_signature = _semantic_scene_signature(
             thread.scene_signature)
         thread.source_activity_generation = self.source_activity_generation
         thread.source_document = doc
+        thread.camera_motion_signature = (
+            self._current_camera_motion_signature(render_doc))
         thread.active_rect = active_rect
         thread.interactive_snapshot = interactive_state
         thread.started_at = now
@@ -4100,8 +4579,15 @@ class LucyDialog(gui.GeDialog):
             self.capture_thread = None
             if interactive_state is not None:
                 self._retire_interactive_snapshot(interactive_state)
+            if interactive:
+                self._trace_drag("capture_start_failed", now=now)
             self._set_status("Could not start background capture")
             return False
+        if interactive:
+            self._trace_drag(
+                "capture_started", now=now,
+                isolated=isolated,
+                direct_move=bool(direct_move))
         return True
 
     @staticmethod
@@ -4130,6 +4616,8 @@ class LucyDialog(gui.GeDialog):
         # worker still needs the GIL to return from Main().
         if thread_running:
             if getattr(thread, "main_completed", False):
+                if getattr(thread, "interactive", False):
+                    self._trace_drag("capture_completion_wait")
                 self._post_realtime_event()
             return False
         # C4DThread has an explicit lifetime: Maxon requires every started
@@ -4226,6 +4714,14 @@ class LucyDialog(gui.GeDialog):
             self.next_capture_at = (
                 finished + self.effective_interval_ms / 1000.0)
         if not thread.success:
+            if getattr(thread, "interactive", False):
+                self._trace_drag(
+                    "capture_discarded" if thread.cancelled
+                    else "capture_failed",
+                    cancelled=bool(thread.cancelled),
+                    had_error=bool(thread.error),
+                    duration_ms=round(thread.duration_ms, 3),
+                )
             failed_snapshot = getattr(thread, "interactive_snapshot", None)
             if failed_snapshot is not None:
                 self._retire_interactive_snapshot(failed_snapshot)
@@ -4251,10 +4747,15 @@ class LucyDialog(gui.GeDialog):
             thread, "scene_signature", self.last_scene_signature)
         self.last_observed_scene_signature = self.last_scene_signature
         if not thread.interactive:
+            source_document = getattr(thread, "source_document", None)
+            if hasattr(thread, "camera_motion_signature"):
+                self._note_settled_camera_signature(
+                    thread.camera_motion_signature)
+            else:
+                self._note_settled_camera(source_document)
             self._register_settled_frame(
                 thread.bitmap, finished,
                 allow_reset=self.running)
-            source_document = getattr(thread, "source_document", None)
             current_signature = (
                 self._scene_signature(source_document)
                 if (_sdk_object_alive(source_document) and
@@ -4271,6 +4772,17 @@ class LucyDialog(gui.GeDialog):
                     source_document, thread.document, thread.render_data,
                     thread_active_rect, thread.clean_feed)
         self.published_source_revision += 1
+        if thread.interactive:
+            self._trace_drag(
+                "capture_published",
+                revision=int(self.published_source_revision),
+                duration_ms=round(thread.duration_ms, 3),
+            )
+        # viewport.jpg and the revision which identifies it are one logical
+        # publication. If Windows briefly holds control.json open, keep the
+        # latest revision pending so Timer can deliver it without waiting for
+        # another camera/object edit.
+        self.control_sync_pending = True
         self._write_control()
         return True
 
@@ -4303,16 +4815,93 @@ class LucyDialog(gui.GeDialog):
             return False
         return True
 
+    def _discard_drag_trace(self):
+        """Forget an incomplete drag without writing from a hot callback."""
+        self.drag_trace_active = False
+        self.drag_trace_started_at = 0.0
+        self.drag_trace_source_revision = 0
+        self.drag_trace_events = []
+
+    def _begin_drag_trace(self, now):
+        """Open one bounded, in-memory trace for an editor drag."""
+        self.drag_trace_active = True
+        self.drag_trace_started_at = float(now)
+        self.drag_trace_source_revision = int(self.published_source_revision)
+        self.drag_trace_events = []
+
+    def _trace_drag(self, event, now=None, **fields):
+        """Append primitive diagnostics without touching disk or the SDK."""
+        if not self.drag_trace_active:
+            return False
+        current = time.monotonic() if now is None else float(now)
+        entry = {
+            "event": str(event),
+            "t_ms": round(max(
+                0.0, current - self.drag_trace_started_at) * 1000.0, 3),
+        }
+        for key, value in fields.items():
+            if value is None or isinstance(value, (bool, int, float, str)):
+                entry[str(key)] = value
+        self.drag_trace_events.append(entry)
+        if len(self.drag_trace_events) > DRAG_TRACE_EVENT_LIMIT:
+            del self.drag_trace_events[
+                :len(self.drag_trace_events) - DRAG_TRACE_EVENT_LIMIT]
+        return True
+
+    def _flush_drag_trace(self, now=None):
+        """Persist one completed drag after mouse-up, never during motion."""
+        if not self.drag_trace_active:
+            return False
+        current = time.monotonic() if now is None else float(now)
+        thread = self.capture_thread
+        payload = {
+            "schema": 1,
+            "reason": "move_end",
+            "pid": os.getpid(),
+            "duration_ms": round(max(
+                0.0, current - self.drag_trace_started_at) * 1000.0, 3),
+            "source_revision_start": int(
+                self.drag_trace_source_revision),
+            "source_revision_end": int(self.published_source_revision),
+            "thread_at_end": {
+                "present": thread is not None,
+                "interactive": bool(
+                    getattr(thread, "interactive", False)),
+                "main_completed": bool(
+                    getattr(thread, "main_completed", False)),
+                "success": bool(getattr(thread, "success", False)),
+                "cancelled": bool(getattr(thread, "cancelled", False)),
+            },
+            "events": list(self.drag_trace_events),
+        }
+        try:
+            _atomic_write_json(self.drag_trace_path, payload)
+        except Exception:
+            # This file is optional diagnostics. A write or serialization
+            # failure must never suppress MOVE_END's final capture event.
+            return False
+        finally:
+            self._discard_drag_trace()
+        return True
+
     def _latch_interactive_phase(self, phase, now):
         """Update only Python state for the newest editor-move phase."""
         move_end = phase == getattr(c4d, "MOVE_END", 2)
         if phase in (getattr(c4d, "MOVE_START", 0),
                      getattr(c4d, "MOVE_CONTINUE", 1)):
+            if (phase == getattr(c4d, "MOVE_START", 0) or
+                    self.interactive_camera_start_signature is None):
+                self._begin_interactive_camera_motion()
+            self.unsafe_completion_retry_used = False
+            self.unsafe_completion_wait_retry_used = False
             self.editor_move_active = True
             self.interactive_until = 0.0
             self.capture_pending = True
             self.final_clean_pending = False
         elif move_end:
+            self._finish_interactive_camera_motion()
+            self.unsafe_completion_retry_used = False
+            self.unsafe_completion_wait_retry_used = False
             self.editor_move_active = False
             self.interactive_until = 0.0
             self.capture_pending = False
@@ -4344,6 +4933,17 @@ class LucyDialog(gui.GeDialog):
             self.auto_resume_pending = True
         if not self.running and not self.auto_paused:
             return False
+        move_start = phase == getattr(c4d, "MOVE_START", 0)
+        move_continue = phase == getattr(c4d, "MOVE_CONTINUE", 1)
+        move_end_phase = phase == getattr(c4d, "MOVE_END", 2)
+        if move_start or (move_continue and not self.drag_trace_active):
+            self._begin_drag_trace(now)
+        if move_start:
+            self._trace_drag("move_start", now=now)
+        elif move_continue:
+            self._trace_drag("move_continue", now=now)
+        elif move_end_phase:
+            self._trace_drag("move_end", now=now)
         move_end = self._latch_interactive_phase(phase, now)
         thread = self.capture_thread
         if thread is not None:
@@ -4380,6 +4980,8 @@ class LucyDialog(gui.GeDialog):
                 self.realtime_pump_busy = False
             return True
 
+        if move_end:
+            self._flush_drag_trace(now)
         self._post_realtime_event()
         return True
 
@@ -4998,6 +5600,7 @@ class LucyDialog(gui.GeDialog):
         # immediately even when Cinema suppresses dialog timer messages.
         self._remember_interactive_snapshot(
             doc, render_doc, rd, active_rect, self.GetBool(ID_CLEAN_FEED))
+        self._note_settled_camera(doc)
         self._register_settled_frame(
             bmp, self.last_capture, allow_reset=self.running)
         return True
@@ -5094,6 +5697,9 @@ class LucyDialog(gui.GeDialog):
         self.interactive_pending_phase = None
         self.realtime_event_queued = False
         self.realtime_pump_busy = False
+        self.unsafe_completion_retry_used = False
+        self.unsafe_completion_wait_retry_used = False
+        self.interactive_camera_start_signature = None
         self.auto_paused = False
         self.auto_pause_armed = False
         self.last_activity_at = time.monotonic()
@@ -5218,6 +5824,7 @@ class LucyDialog(gui.GeDialog):
     def _stop(self, update_ui=True, recording_grace=5.0,
               terminate_worker=True):
         recording_work_path = self.recording_work_path
+        self._discard_drag_trace()
         self.running = False
         self.auto_paused = False
         self.auto_pause_armed = False
@@ -5227,6 +5834,9 @@ class LucyDialog(gui.GeDialog):
         self.interactive_pending_phase = None
         self.realtime_event_queued = False
         self.realtime_pump_busy = False
+        self.unsafe_completion_retry_used = False
+        self.unsafe_completion_wait_retry_used = False
+        self.interactive_camera_start_signature = None
         self.auto_paused_document = None
         self.auto_paused_scene_signature = None
         self.render_frames_active = False
@@ -5267,6 +5877,7 @@ class LucyDialog(gui.GeDialog):
         self.worker_stage = ""
         self.worker_started_at = 0.0
         self.resync_pending_at = 0.0
+        self.control_sync_pending = False
         self._close_worker_log()
         if capture_joined:
             self._restore_followed_views()
@@ -5277,6 +5888,7 @@ class LucyDialog(gui.GeDialog):
         self.last_source_projection = None
         self.resync_cut_armed = False
         self.last_settled_fingerprint = None
+        self.last_settled_camera_signature = None
         try:
             self.telemetry_path.unlink()
         except OSError:
@@ -5299,11 +5911,27 @@ class LucyDialog(gui.GeDialog):
             return False
         self._set_status(
             "Auto resync…" if automatic else "Resetting AI context…")
+        reuse_source_available = bool(
+            reuse_source and self.input_path.is_file())
+        restart_document = documents.GetActiveDocument()
+        restart_active_rect = _active_rect_for_aspect(
+            _render_film_aspect(restart_document))
+        preserve_settled_baseline = bool(
+            automatic and reuse_source_available and
+            self.published_active_rect == restart_active_rect)
+        settled_fingerprint = self.last_settled_fingerprint
+        settled_camera_signature = self.last_settled_camera_signature
         self._stop(update_ui=False)
         self.SetString(ID_START, "▶ Start")
         restarted = self._start(
-            reuse_source=bool(reuse_source and self.input_path.is_file()),
+            reuse_source=reuse_source_available,
             preserve_preview=bool(automatic))
+        if restarted and preserve_settled_baseline:
+            # Automatic reconnect reuses the authoritative final viewport
+            # frame. Keep its comparison baseline too, otherwise the very
+            # next camera cut would be accepted as an unexamined first frame.
+            self.last_settled_fingerprint = settled_fingerprint
+            self.last_settled_camera_signature = settled_camera_signature
         if not restarted:
             self._freeze_render_timer()
         return self.running
@@ -5368,8 +5996,10 @@ class LucyDialog(gui.GeDialog):
                 "updated": time.time(),
             })
         except OSError as exc:
+            self.control_sync_pending = True
             self._set_status("Could not update the control file: %s" % exc)
             return False
+        self.control_sync_pending = False
         return True
 
     def _write_recording_control(self):
@@ -5523,14 +6153,56 @@ class LucyDialog(gui.GeDialog):
                 self._post_realtime_event()
                 return True
             if not self._realtime_pump_context_safe():
-                # START/CONTINUE are pumped synchronously by Message; repeatedly
-                # re-posting their completion event during a native drag only
-                # competes with the MOVE stream. The next MOVE callback harvests
-                # the ready frame. MOVE_END/idle still keep one deferred retry.
-                if not self.editor_move_active:
+                # Cinema can deliver SourceCaptureThread's completion event
+                # while its native Move tool still owns the draw context. A
+                # GeDialog timer or another MOVE_CONTINUE is not guaranteed to
+                # arrive before mouse-up, so harvest an already completed
+                # *private* interactive render here and keep the single-flight
+                # chain alive. ``aggressive=True`` preserves the direct-MOVE
+                # rule in _start_background_capture: a missing cache may only
+                # queue a safe clone and can never fall back to the live scene.
+                thread = self.capture_thread
+                completed_drag = bool(
+                    self.editor_move_active and thread is not None and
+                    getattr(thread, "interactive", False) and
+                    getattr(thread, "isolated", False))
+                completion_announced = bool(
+                    completed_drag and
+                    getattr(thread, "main_completed", False))
+                if completed_drag:
+                    try:
+                        completed_drag = not bool(thread.IsRunning())
+                    except (AttributeError, ReferenceError, RuntimeError):
+                        completed_drag = False
+                if completed_drag:
+                    self.unsafe_completion_wait_retry_used = False
+                    self.realtime_pump_busy = True
+                    try:
+                        self._pump_interactive_move(
+                            None, time.monotonic(), aggressive=True)
+                    except (AttributeError, OSError, ReferenceError,
+                            RuntimeError, TypeError):
+                        self.capture_pending = True
+                        if not self.unsafe_completion_retry_used:
+                            self.unsafe_completion_retry_used = True
+                            self._post_realtime_event()
+                    else:
+                        self.unsafe_completion_retry_used = False
+                    finally:
+                        self.realtime_pump_busy = False
+                elif completion_announced:
+                    # Main() posts immediately before the native wrapper can
+                    # report IsRunning=False. Preserve that one narrow retry.
+                    if not self.unsafe_completion_wait_retry_used:
+                        self.unsafe_completion_wait_retry_used = True
+                        self._post_realtime_event()
+                elif not self.editor_move_active:
+                    # MOVE_END and idle work still need one safe main-loop retry.
                     self._post_realtime_event()
                 return True
 
+            self.unsafe_completion_retry_used = False
+            self.unsafe_completion_wait_retry_used = False
             phase = self.interactive_pending_phase
             self.realtime_pump_busy = True
             try:
@@ -5775,6 +6447,11 @@ class LucyDialog(gui.GeDialog):
                 self.last_activity_at = now
                 self.source_activity_generation += 1
             self._finish_background_capture()
+        if self.control_sync_pending:
+            # A final viewport JPEG must never remain newer than control.json.
+            # Retrying here keeps publication latest-only and does not trigger
+            # another expensive Cinema 4D render.
+            self._write_control()
         if now >= self.next_status_poll_at:
             self.next_status_poll_at = now + STATUS_POLL_SECONDS
             status = _read_json(self.state / "status.json", {})
@@ -5815,6 +6492,8 @@ class LucyDialog(gui.GeDialog):
                 self.last_editor_move_at > 0.0 and
                 now - self.last_editor_move_at >=
                 INTERACTIVE_LOST_END_SECONDS):
+            self._discard_drag_trace()
+            self._finish_interactive_camera_motion(document)
             self.editor_move_active = False
             self.interactive_until = 0.0
             self.capture_pending = False
