@@ -6,6 +6,14 @@ Created by [**VantageInc**](https://vantageinc.co/) / [**@thesibilev**](https://
 
 ![Version](https://img.shields.io/badge/version-1.0.3-7c3aed)
 
+![Cinema 4D viewport beside the LucyLive AI preview](assets/ai-render-editorial-compare.png)
+
+## Examples
+
+![Character AI preview](assets/ai-render-character.png)
+
+![Interior AI preview](assets/ai-render-interior.png)
+
 ## Download
 
 - [Windows 10/11](https://github.com/VantageInc/LucyLive-AI-Render/releases/download/v1.0.3/LucyLive-v1.0.3-preview-windows.zip)
