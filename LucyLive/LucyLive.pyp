@@ -44,6 +44,7 @@ INTERACTIVE_LOST_END_SECONDS = 1.0
 # every 50 ms UI slice.
 INTERACTIVE_INTERVAL_MS = 125
 DRAG_TRACE_EVENT_LIMIT = 1024
+UNSAFE_RESUME_RETRY_LIMIT = 4
 IDLE_SAFETY_REFRESH_SECONDS = 2.0
 AUTO_RESYNC_THRESHOLD = 0.26
 AUTO_RESYNC_DELAY_SECONDS = 0.35
@@ -147,7 +148,13 @@ def _drain_deferred_capture_owners():
     """Retry SDK joins from Cinema's main thread without dropping ownership."""
     for owner in tuple(_DEFERRED_CAPTURE_OWNERS):
         try:
-            if not owner._stop_capture_thread():
+            preserve_snapshot = bool(getattr(
+                owner, "preserve_interactive_snapshot_on_join", False))
+            preserve_capture_requests = bool(
+                preserve_snapshot and getattr(owner, "running", False))
+            if not owner._stop_capture_thread(
+                    preserve_interactive_snapshot=preserve_snapshot,
+                    preserve_capture_requests=preserve_capture_requests):
                 continue
             _finish_deferred_capture_cleanup(owner)
         except Exception:
@@ -2113,6 +2120,7 @@ class LucyDialog(gui.GeDialog):
         self.auto_paused_scene_signature = None
         self.auto_resume_pending = False
         self.auto_resume_source_refresh = False
+        self.auto_resume_requires_fresh_source = False
         self.render_frames_active = False
         self.render_frames_cancel_requested = False
         self.render_frames_phase = ""
@@ -2173,6 +2181,7 @@ class LucyDialog(gui.GeDialog):
         self.worker_stage = ""
         self.worker_started_at = 0.0
         self.capture_thread = None
+        self.preserve_interactive_snapshot_on_join = False
         self.capture_pending = False
         self.capture_pending_clean = False
         self.manual_capture_pending = False
@@ -2189,6 +2198,7 @@ class LucyDialog(gui.GeDialog):
         self.realtime_pump_busy = False
         self.unsafe_completion_retry_used = False
         self.unsafe_completion_wait_retry_used = False
+        self.unsafe_resume_retry_count = 0
         self.drag_trace_active = False
         self.drag_trace_started_at = 0.0
         self.drag_trace_source_revision = 0
@@ -2499,7 +2509,8 @@ class LucyDialog(gui.GeDialog):
         worker_stopped = self._terminate_worker_process()
         self._stop(
             update_ui=False, recording_grace=0.0,
-            terminate_worker=False)
+            terminate_worker=False,
+            preserve_interactive_snapshot=True)
         self.SetString(ID_RENDER_FRAMES, "Render Frames")
         if not worker_stopped or self.proc is not None:
             self.SetString(ID_START, "▶ Start")
@@ -2629,6 +2640,15 @@ class LucyDialog(gui.GeDialog):
         if not self.running or self.auto_paused:
             gui.MessageDialog("Press Start before rendering frames.")
             return False
+        if self in _DEFERRED_CAPTURE_OWNERS:
+            # A previous session's detached viewport render may still be
+            # returning. Drain it before allocating a new sequence; otherwise
+            # its owner-level cleanup could release the new Render Frames
+            # resources. The retry is non-blocking while C4DThread is active.
+            _drain_deferred_capture_owners()
+            if self in _DEFERRED_CAPTURE_OWNERS:
+                self._set_status("Waiting for previous viewport capture…")
+                return False
         if self.recording_active or self.recording_stopping:
             gui.MessageDialog(
                 "Stop REC and wait for the MP4 before rendering frames.")
@@ -3320,12 +3340,51 @@ class LucyDialog(gui.GeDialog):
         document = documents.GetActiveDocument()
         if not _sdk_object_alive(document):
             return False
-        force_source_refresh = bool(self.auto_resume_source_refresh)
+        if (self.capture_thread is not None and
+                not _same_sdk_object(self.source_document, document)):
+            # Auto-pause can leave a cancelled safety render returning on its
+            # private clone. A newly active Cinema document must not start a
+            # worker until that old owner has joined and the source switch can
+            # be accepted atomically.
+            self._cancel_background_capture()
+            self._finish_background_capture()
+            if self.capture_thread is not None:
+                _retain_deferred_capture_owner(self)
+                self.auto_resume_pending = True
+                self.auto_resume_source_refresh = True
+                self.auto_resume_requires_fresh_source = True
+                self._set_status("Waiting for previous viewport capture…")
+                return False
+        resume_source_document = (
+            self.source_document
+            if _sdk_object_alive(self.source_document)
+            else self.auto_paused_document)
+        source_document_changed = not _same_sdk_object(
+            resume_source_document, document)
+        if (source_document_changed and
+                not self._realtime_pump_context_safe()):
+            # Switching documents requires a fresh private clone before cloud
+            # transport starts. Defer that native capture out of Cinema's draw
+            # callback instead of reusing the previous document's JPEG.
+            self.auto_resume_pending = True
+            self.auto_resume_source_refresh = True
+            self.auto_resume_requires_fresh_source = True
+            self._set_status("Waiting for a safe viewport refresh…")
+            self._post_realtime_event()
+            return False
+        requires_fresh_source = bool(
+            self.auto_resume_requires_fresh_source or
+            source_document_changed)
+        force_source_refresh = bool(
+            self.auto_resume_source_refresh or requires_fresh_source)
         self.auto_resume_pending = False
         self.auto_resume_source_refresh = False
+        self.auto_resume_requires_fresh_source = False
         if not self._start(
-                reuse_source=True, preserve_preview=True,
-                allow_stale_source=True):
+                reuse_source=not requires_fresh_source,
+                preserve_preview=True,
+                allow_stale_source=not requires_fresh_source,
+                preserve_interactive_snapshot=True):
             self.interactive_pending_phase = pending_phase
             self.realtime_event_queued = pending_event
             self.realtime_pump_busy = pump_was_busy
@@ -3335,15 +3394,17 @@ class LucyDialog(gui.GeDialog):
                 document)
             self.auto_resume_pending = False
             self.auto_resume_source_refresh = force_source_refresh
+            self.auto_resume_requires_fresh_source = requires_fresh_source
             self.SetString(ID_START, "■ Stop · Paused")
             return False
         self.last_activity_at = now
         self._resume_render_timer(now)
-        if force_source_refresh:
+        if force_source_refresh and not requires_fresh_source:
             self.resolution_capture_pending = True
             self.last_scene_signature = None
             self.next_capture_at = 0.0
-        elif refresh_source and self.GetBool(ID_AUTO):
+        elif (not requires_fresh_source and refresh_source and
+              self.GetBool(ID_AUTO)):
             self.capture_pending = True
             self.final_clean_pending = True
             self.last_scene_signature = None
@@ -3707,12 +3768,15 @@ class LucyDialog(gui.GeDialog):
         return self._note_settled_camera_signature(
             self._current_camera_motion_signature(document))
 
-    def _prepare_source_document(self, document):
+    def _prepare_source_document(
+            self, document, preserve_interactive_snapshot=False):
         """Switch capture ownership safely when the active document changes."""
         if not _sdk_object_alive(document):
             document = None
         previous = self.source_document
         if _same_sdk_object(previous, document):
+            if document is not None and not self.view_context_initialized:
+                self._note_view_context(document, arm_change=False)
             return False
         replacing_existing_source = bool(
             previous is not None or self.resync_cut_armed)
@@ -3730,7 +3794,15 @@ class LucyDialog(gui.GeDialog):
         if previous is not None:
             self._restore_followed_views(previous)
             self.resync_cut_armed = True
-        self._retire_interactive_snapshot()
+        snapshot = self.interactive_snapshot
+        keep_joined_snapshot = bool(
+            preserve_interactive_snapshot and previous is None and
+            self.capture_thread is None and snapshot is not None and
+            not snapshot.retired and
+            _same_sdk_object(snapshot.source_document, document) and
+            _sdk_object_alive(snapshot.document))
+        if not keep_joined_snapshot:
+            self._retire_interactive_snapshot()
 
         self.source_document = document
         if replacing_existing_source:
@@ -4648,6 +4720,7 @@ class LucyDialog(gui.GeDialog):
             # activity arrived while this capture was in flight.
             thread.scene_signature = post_signature
         self.capture_thread = None
+        self.preserve_interactive_snapshot_on_join = False
         # A source switch/stop can retain this owner while this exact thread is
         # running. Remove it before the pump starts a replacement, otherwise a
         # later Timer would cancel that fresh capture as deferred cleanup.
@@ -4886,6 +4959,7 @@ class LucyDialog(gui.GeDialog):
 
     def _latch_interactive_phase(self, phase, now):
         """Update only Python state for the newest editor-move phase."""
+        self.unsafe_resume_retry_count = 0
         move_end = phase == getattr(c4d, "MOVE_END", 2)
         if phase in (getattr(c4d, "MOVE_START", 0),
                      getattr(c4d, "MOVE_CONTINUE", 1)):
@@ -5503,20 +5577,35 @@ class LucyDialog(gui.GeDialog):
             return True
         return self._check_recording_watchdog(now)
 
-    def _stop_capture_thread(self):
+    def _stop_capture_thread(
+            self, preserve_interactive_snapshot=False,
+            preserve_capture_requests=False):
         thread = self.capture_thread
+        preserve_on_join = bool(preserve_interactive_snapshot)
+        # A cancelled interactive render borrowed the cached document. It is
+        # no longer a trustworthy seed, even when the surrounding reconnect
+        # would otherwise carry a joined cache forward. A noninteractive
+        # safety render owns a separate clone, so the prior cache stays safe.
+        if (thread is not None and self.interactive_snapshot is not None and
+                getattr(thread, "interactive_snapshot", None) is
+                self.interactive_snapshot):
+            preserve_on_join = False
+        self.preserve_interactive_snapshot_on_join = preserve_on_join
         joined = True
         if thread is not None:
             joined = self._join_capture_thread(thread)
-        self.capture_pending = False
-        self.capture_pending_clean = False
-        self.manual_capture_pending = False
-        self.final_clean_pending = False
-        self.resolution_capture_pending = False
-        self.editor_move_active = False
-        self.interactive_until = 0.0
+        if not preserve_capture_requests:
+            self.capture_pending = False
+            self.capture_pending_clean = False
+            self.manual_capture_pending = False
+            self.final_clean_pending = False
+            self.resolution_capture_pending = False
+            self.editor_move_active = False
+            self.interactive_until = 0.0
         if joined:
-            self._retire_interactive_snapshot()
+            if not self.preserve_interactive_snapshot_on_join:
+                self._retire_interactive_snapshot()
+            self.preserve_interactive_snapshot_on_join = False
             _discard_deferred_capture_owner(self)
         return joined
 
@@ -5643,7 +5732,8 @@ class LucyDialog(gui.GeDialog):
         return success
 
     def _start(self, reuse_source=False, preserve_preview=False,
-               allow_stale_source=False):
+               allow_stale_source=False,
+               preserve_interactive_snapshot=False):
         if (self.proc is not None and
                 not self._terminate_worker_process()):
             gui.MessageDialog(
@@ -5699,6 +5789,7 @@ class LucyDialog(gui.GeDialog):
         self.realtime_pump_busy = False
         self.unsafe_completion_retry_used = False
         self.unsafe_completion_wait_retry_used = False
+        self.unsafe_resume_retry_count = 0
         self.interactive_camera_start_signature = None
         self.auto_paused = False
         self.auto_pause_armed = False
@@ -5707,11 +5798,22 @@ class LucyDialog(gui.GeDialog):
         self.auto_paused_scene_signature = None
         self.auto_resume_pending = False
         self.auto_resume_source_refresh = False
+        self.auto_resume_requires_fresh_source = False
         if not preserve_preview:
             self.preview.clear_ai()
-        document = documents.GetActiveDocument()
-        self._prepare_source_document(document)
+        requested_document = documents.GetActiveDocument()
+        if not _sdk_object_alive(requested_document):
+            requested_document = None
+        self._prepare_source_document(
+            requested_document,
+            preserve_interactive_snapshot=preserve_interactive_snapshot)
         document = self.source_document
+        if not _same_sdk_object(document, requested_document):
+            # _prepare_source_document() never waits for an SDK render thread.
+            # Do not start cloud transport with a stale/previous document while
+            # that deferred owner is still being released.
+            self._set_status("Waiting for previous viewport capture…")
+            return False
         can_reuse_source = bool(
             reuse_source and
             self.input_path.is_file() and
@@ -5822,20 +5924,38 @@ class LucyDialog(gui.GeDialog):
         return stopped
 
     def _stop(self, update_ui=True, recording_grace=5.0,
-              terminate_worker=True):
+              terminate_worker=True,
+              preserve_interactive_snapshot=False):
         recording_work_path = self.recording_work_path
+        snapshot_to_preserve = self.interactive_snapshot
+        source_to_preserve = self.source_document
+        capture = self.capture_thread
+        can_preserve_snapshot = bool(
+            preserve_interactive_snapshot and
+            snapshot_to_preserve is not None and
+            not snapshot_to_preserve.retired and
+            _same_sdk_object(
+                snapshot_to_preserve.source_document,
+                source_to_preserve) and
+            _sdk_object_alive(source_to_preserve) and
+            _sdk_object_alive(snapshot_to_preserve.document) and
+            (capture is None or
+             getattr(capture, "interactive_snapshot", None) is not
+             snapshot_to_preserve))
         self._discard_drag_trace()
         self.running = False
         self.auto_paused = False
         self.auto_pause_armed = False
         self.auto_resume_pending = False
         self.auto_resume_source_refresh = False
+        self.auto_resume_requires_fresh_source = False
         self.interactive_output_poll_at = 0.0
         self.interactive_pending_phase = None
         self.realtime_event_queued = False
         self.realtime_pump_busy = False
         self.unsafe_completion_retry_used = False
         self.unsafe_completion_wait_retry_used = False
+        self.unsafe_resume_retry_count = 0
         self.interactive_camera_start_signature = None
         self.auto_paused_document = None
         self.auto_paused_scene_signature = None
@@ -5851,7 +5971,8 @@ class LucyDialog(gui.GeDialog):
         self.source_sequence_manifest = ""
         self.last_sequence_telemetry_signature = None
         self._clear_auto_animation()
-        capture_joined = self._stop_capture_thread()
+        capture_joined = self._stop_capture_thread(
+            preserve_interactive_snapshot=can_preserve_snapshot)
         if capture_joined:
             self.render_frames_cancel_requested = False
             self.render_frames_phase = ""
@@ -5881,7 +6002,17 @@ class LucyDialog(gui.GeDialog):
         self._close_worker_log()
         if capture_joined:
             self._restore_followed_views()
-        self.source_document = None
+        if (can_preserve_snapshot and
+                self.interactive_snapshot is snapshot_to_preserve and
+                not snapshot_to_preserve.retired and
+                _sdk_object_alive(source_to_preserve)):
+            # A transport reconnect does not change the live Cinema document.
+            # Keep that identity attached until _start() validates it against
+            # the active document; otherwise a deferred safety-render join
+            # would make the next held MOVE look like a document switch.
+            self.source_document = source_to_preserve
+        else:
+            self.source_document = None
         self.view_context_initialized = False
         self.last_source_view_index = None
         self.last_source_camera = None
@@ -5921,11 +6052,16 @@ class LucyDialog(gui.GeDialog):
             self.published_active_rect == restart_active_rect)
         settled_fingerprint = self.last_settled_fingerprint
         settled_camera_signature = self.last_settled_camera_signature
-        self._stop(update_ui=False)
+        preserve_interactive_snapshot = bool(
+            automatic and reuse_source_available)
+        self._stop(
+            update_ui=False,
+            preserve_interactive_snapshot=preserve_interactive_snapshot)
         self.SetString(ID_START, "▶ Start")
         restarted = self._start(
             reuse_source=reuse_source_available,
-            preserve_preview=bool(automatic))
+            preserve_preview=bool(automatic),
+            preserve_interactive_snapshot=preserve_interactive_snapshot)
         if restarted and preserve_settled_baseline:
             # Automatic reconnect reuses the authoritative final viewport
             # frame. Keep its comparison baseline too, otherwise the very
@@ -6196,6 +6332,15 @@ class LucyDialog(gui.GeDialog):
                     if not self.unsafe_completion_wait_retry_used:
                         self.unsafe_completion_wait_retry_used = True
                         self._post_realtime_event()
+                elif (self.auto_paused and self.auto_resume_pending and
+                      self.interactive_pending_phase is not None):
+                    # A document switch cannot clone/render inside Cinema's
+                    # draw context. Preserve one bounded custom-event retry so
+                    # held MOVE_START does not depend on Timer or mouse-up.
+                    if (self.unsafe_resume_retry_count <
+                            UNSAFE_RESUME_RETRY_LIMIT):
+                        self.unsafe_resume_retry_count += 1
+                        self._post_realtime_event()
                 elif not self.editor_move_active:
                     # MOVE_END and idle work still need one safe main-loop retry.
                     self._post_realtime_event()
@@ -6203,6 +6348,7 @@ class LucyDialog(gui.GeDialog):
 
             self.unsafe_completion_retry_used = False
             self.unsafe_completion_wait_retry_used = False
+            self.unsafe_resume_retry_count = 0
             phase = self.interactive_pending_phase
             self.realtime_pump_busy = True
             try:

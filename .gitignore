@@ -1,4 +1,5 @@
 LucyLive/vendor/
+LucyLive/wheels/
 LucyLive/.lucy_live_install.lock
 LucyLive/.vendor.*/
 **/__pycache__/
