@@ -38,7 +38,20 @@ components and must remain with redistributed builds.
 | typing_extensions | 4.16.0 |
 | websockets | 16.1.1 |
 
-The fal-client 0.14.1 wheel does not include a standalone license file or a
-license field in its package metadata. Confirm its redistribution terms from
-the package owner before public distribution. This preview delivery does not
-grant rights to third-party names, services, models, or assets.
+## fal-client 0.14.1
+
+The published fal-client 0.14.1 wheel does not include a standalone license
+file or license field in its package metadata. Its source tag resolves to
+commit `d82d13d28433e36f29cad1e79810826814538065` in the official fal repository,
+whose root license is Apache License 2.0. A verbatim copy from that pinned
+commit is included at:
+
+`licenses/python/fal-client-0.14.1/LICENSE`
+
+Source and license provenance:
+
+- https://github.com/fal-ai/fal/releases/tag/fal_client_v0.14.1
+- https://github.com/fal-ai/fal/blob/d82d13d28433e36f29cad1e79810826814538065/LICENSE
+
+This preview delivery does not grant rights to third-party names, services,
+models, or assets.
